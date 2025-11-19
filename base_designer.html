@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SCUM Modular Base Designer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 20px;
+            background-color: #f4f4f4;
+        }
+        #canvasContainer {
+            border: 1px solid #ccc;
+            background-color: white;
+            box-shadow: 2px 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            cursor: default;
+            overflow: hidden;
+        }
+        canvas {
+            background-color: #e0e0e0;
+        }
+        .controls {
+            margin-bottom: 15px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .controls button {
+            padding: 10px 15px;
+            font-size: 16px;
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            transition: background-color 0.2s;
+        }
+        .controls button:hover {
+            background-color: #0056b3;
+        }
+        .controls button.active {
+            background-color: #28a745;
+        }
+        .info {
+            font-size: 0.9em;
+            color: #666;
+            margin-top: 10px;
+            text-align: center;
+            max-width: 800px;
+        }
+        .instructions {
+            margin-top: 5px;
+            font-weight: bold;
+            color: #333;
+        }
+        .status-msg {
+            color: #28a745;
+            font-weight: bold;
+            font-size: 0.8em;
+            margin-left: 10px;
+            opacity: 0;
+            transition: opacity 0.5s;
+        }
+    </style>
+</head>
+<body>
+    <h1>SCUM Modular Base Designer</h1>
+    <div class="controls">
+        <button id="placeSquareBtn">Place Square</button>
+        <button id="placeTriangleBtn">Place Triangle</button>
+        <button id="deletePieceBtn">Delete Selected</button>
+        <button id="clearCanvasBtn">Clear All</button>
+        <span>Mode: <span id="currentMode">Select/Drag</span></span>
+        <span id="saveStatus" class="status-msg">Saved to URL!</span>
+    </div>
+    <div id="canvasContainer">
+        <canvas id="gameCanvas" width="1000" height="700"></canvas>
+    </div>
+    <div class="info">
+        Click a "Place" button, then click on canvas to place one piece. Mode changes automatically.<br>
+        Click on an existing piece to select/drag it. Drag green handle to rotate.<br>
+        <div class="instructions">
+            SHORTCUTS: [Del] to delete, [Ctrl+C] to copy, [Ctrl+V] to paste.
+        </div>
+        <strong>URL updates automatically. Copy the browser URL to share your design.</strong>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const saveStatusEl = document.getElementById('saveStatus');
+
+        const PIECE_UNIT_SIZE = 60; // Side length for squares and triangles in pixels
+        const TRIANGLE_HEIGHT = Math.sqrt(3) / 2 * PIECE_UNIT_SIZE; // Height of an equilateral triangle
+        const ROTATION_HANDLE_RADIUS = 12;
+        const ROTATION_HANDLE_OFFSET = PIECE_UNIT_SIZE / 2 + 25; // Distance from center of piece to handle
+
+        // Snapping constants
+        const EDGE_SNAP_DISTANCE = 25; // Max pixel distance for edges to snap together
+        const ROTATION_SNAP_TOLERANCE_DEG = 15; // Max angle difference for rotational snap
+
+        let pieces = []; // Array to store placed pieces
+        let currentTool = 'select'; // 'select', 'placeSquare', 'placeTriangle'
+        let selectedPiece = null;
+        let clipboardPiece = null; // Holds the data for Copy/Paste
+
+        let isDraggingPiece = false;
+        let isRotatingPiece = false;
+        let isPanning = false;
+        let hasStateChanged = false; // Track if we need to save after an interaction
+
+        let dragOffsetX, dragOffsetY; // Offset from mouse to piece's top-left
+        let rotationInitialAngle; // Angle from piece center to mouse when rotation started
+        let initialPieceRotation; // Piece's rotation when rotation started
+
+        let panOffsetX = 0; // Canvas pan offset
+        let panOffsetY = 0;
+        let panStartX, panStartY; // Mouse position when pan started
+
+        // --- Event Listeners ---
+        document.getElementById('placeSquareBtn').addEventListener('click', () => {
+            currentTool = 'placeSquare';
+            deselectPiece();
+            updateControls();
+        });
+        document.getElementById('placeTriangleBtn').addEventListener('click', () => {
+            currentTool = 'placeTriangle';
+            deselectPiece();
+            updateControls();
+        });
+        document.getElementById('deletePieceBtn').addEventListener('click', () => {
+            deleteSelectedPiece();
+            saveStateToUrl();
+        });
+        document.getElementById('clearCanvasBtn').addEventListener('click', () => {
+            clearCanvas();
+            saveStateToUrl();
+        });
+        document.addEventListener('keydown', onKeyDown); // For 'Del' and Ctrl+C/V keys
+
+        canvas.addEventListener('mousedown', onMouseDown);
+        canvas.addEventListener('mousemove', onMouseMove);
+        canvas.addEventListener('mouseup', onMouseUp);
+        canvas.addEventListener('mouseout', onMouseUp);
+        canvas.addEventListener('contextmenu', (e) => e.preventDefault()); // Prevent right-click context menu
+        
+        // Load state when page loads
+        window.addEventListener('load', loadStateFromUrl);
+        // Handle browser back/forward buttons
+        window.addEventListener('popstate', loadStateFromUrl);
+
+        // --- URL Persistence Logic ---
+
+        // Format: Array of [TypeID, x, y, rotation]
+        // TypeID: 0 = square, 1 = triangle
+        function saveStateToUrl() {
+            if (pieces.length === 0) {
+                // Clean URL if empty
+                const url = new URL(window.location);
+                url.searchParams.delete('layout');
+                window.history.replaceState(null, '', url);
+                return;
+            }
+
+            const simplifiedData = pieces.map(p => [
+                p.type === 'square' ? 0 : 1,
+                Math.round(p.x * 100) / 100, // Round to 2 decimals to save space
+                Math.round(p.y * 100) / 100,
+                Math.round(p.rotation * 100) / 100
+            ]);
+
+            const jsonString = JSON.stringify(simplifiedData);
+            // Base64 encode the string
+            const encoded = btoa(jsonString);
+
+            const url = new URL(window.location);
+            url.searchParams.set('layout', encoded);
+            
+            // replaceState updates URL without reloading page
+            window.history.replaceState(null, '', url);
+
+            // Visual feedback
+            saveStatusEl.style.opacity = 1;
+            setTimeout(() => { saveStatusEl.style.opacity = 0; }, 1000);
+        }
+
+        function loadStateFromUrl() {
+            const params = new URLSearchParams(window.location.search);
+            const encoded = params.get('layout');
+
+            if (!encoded) return;
+
+            try {
+                const jsonString = atob(encoded);
+                const simplifiedData = JSON.parse(jsonString);
+
+                pieces = simplifiedData.map(item => ({
+                    type: item[0] === 0 ? 'square' : 'triangle',
+                    x: item[1],
+                    y: item[2],
+                    rotation: item[3]
+                }));
+                
+                draw();
+            } catch (e) {
+                console.error("Error loading layout from URL:", e);
+            }
+        }
+
+        // --- Math Helpers ---
+        function degToRad(degrees) { return degrees * Math.PI / 180; }
+        function radToDeg(radians) { return radians * 180 / Math.PI; }
+
+        function getDistance(p1, p2) {
+            return Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+        }
+
+        function normalizeAngle(angleDeg) {
+            return (angleDeg % 360 + 360) % 360;
+        }
+
+        function getPieceCenter(piece) {
+            return {
+                x: piece.x + PIECE_UNIT_SIZE / 2,
+                y: piece.y + PIECE_UNIT_SIZE / 2
+            };
+        }
+
+        function rotatePoint(point, center, angleRad) {
+            const cos = Math.cos(angleRad);
+            const sin = Math.sin(angleRad);
+            const dx = point.x - center.x;
+            const dy = point.y - center.y;
+            return {
+                x: center.x + dx * cos - dy * sin,
+                y: center.y + dx * sin + dy * cos
+            };
+        }
+
+        function getRotatedBoundingBox(piece) {
+            const center = getPieceCenter(piece);
+            const points = [
+                { x: piece.x, y: piece.y },
+                { x: piece.x + PIECE_UNIT_SIZE, y: piece.y },
+                { x: piece.x + PIECE_UNIT_SIZE, y: piece.y + PIECE_UNIT_SIZE },
+                { x: piece.x, y: piece.y + PIECE_UNIT_SIZE }
+            ];
+
+            const angleRad = degToRad(piece.rotation);
+            const rotatedPoints = points.map(p => rotatePoint(p, center, angleRad));
+
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            rotatedPoints.forEach(p => {
+                minX = Math.min(minX, p.x);
+                minY = Math.min(minY, p.y);
+                maxX = Math.max(maxX, p.x);
+                maxY = Math.max(maxY, p.y);
+            });
+            return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+        }
+
+        // --- Collision/Overlap Check ---
+        function isOverlappingExistingPieces(newPiece) {
+            const newBBox = getRotatedBoundingBox(newPiece);
+
+            for (const existingPiece of pieces) {
+                const existingBBox = getRotatedBoundingBox(existingPiece);
+
+                if (
+                    newBBox.x < existingBBox.x + existingBBox.width &&
+                    newBBox.x + newBBox.width > existingBBox.x &&
+                    newBBox.y < existingBBox.y + existingBBox.height &&
+                    newBBox.y + newBBox.height > existingBBox.y
+                ) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // --- Drawing Functions ---
+        function drawSquare(piece) {
+            ctx.save();
+            ctx.translate(piece.x + PIECE_UNIT_SIZE / 2, piece.y + PIECE_UNIT_SIZE / 2);
+            ctx.rotate(degToRad(piece.rotation));
+            ctx.translate(-(PIECE_UNIT_SIZE / 2), -(PIECE_UNIT_SIZE / 2));
+
+            ctx.fillStyle = '#8B4513';
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 2;
+            ctx.fillRect(0, 0, PIECE_UNIT_SIZE, PIECE_UNIT_SIZE);
+            ctx.strokeRect(0, 0, PIECE_UNIT_SIZE, PIECE_UNIT_SIZE);
+            ctx.restore();
+        }
+
+        function drawEquilateralTriangle(piece) {
+            ctx.save();
+            ctx.translate(piece.x + PIECE_UNIT_SIZE / 2, piece.y + PIECE_UNIT_SIZE / 2);
+            ctx.rotate(degToRad(piece.rotation));
+            ctx.translate(-(PIECE_UNIT_SIZE / 2), -(PIECE_UNIT_SIZE / 2));
+
+            ctx.fillStyle = '#6B8E23';
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 2;
+
+            ctx.beginPath();
+            const p1 = { x: 0, y: PIECE_UNIT_SIZE };
+            const p2 = { x: PIECE_UNIT_SIZE, y: PIECE_UNIT_SIZE };
+            const p3 = { x: PIECE_UNIT_SIZE / 2, y: PIECE_UNIT_SIZE - TRIANGLE_HEIGHT };
+
+            ctx.moveTo(p1.x, p1.y);
+            ctx.lineTo(p2.x, p2.y);
+            ctx.lineTo(p3.x, p3.y);
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.restore();
+        }
+
+        function drawRotationHandle(piece) {
+            const center = getPieceCenter(piece);
+            const handleAngleRad = degToRad(piece.rotation - 90);
+            const handleX = center.x + Math.cos(handleAngleRad) * ROTATION_HANDLE_OFFSET + panOffsetX;
+            const handleY = center.y + Math.sin(handleAngleRad) * ROTATION_HANDLE_OFFSET + panOffsetY;
+
+            ctx.beginPath();
+            ctx.arc(handleX, handleY, ROTATION_HANDLE_RADIUS, 0, 2 * Math.PI);
+            ctx.fillStyle = '#28a745';
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 1;
+            ctx.fill();
+            ctx.stroke();
+
+            return { x: handleX, y: handleY, radius: ROTATION_HANDLE_RADIUS };
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            ctx.save(); 
+            ctx.translate(panOffsetX, panOffsetY);
+
+            pieces.forEach(piece => {
+                if (piece.type === 'square') {
+                    drawSquare(piece);
+                } else if (piece.type === 'triangle') {
+                    drawEquilateralTriangle(piece);
+                }
+            });
+
+            if (selectedPiece) {
+                const bbox = getRotatedBoundingBox(selectedPiece);
+                ctx.strokeStyle = 'blue';
+                ctx.lineWidth = 3;
+                ctx.strokeRect(bbox.x, bbox.y, bbox.width, bbox.height);
+                selectedPiece.handlePos = drawRotationHandle(selectedPiece);
+            }
+            ctx.restore();
+        }
+
+        // --- Edge Snapping Logic ---
+        function getPieceEdgesWithAngles(piece) {
+            const center = getPieceCenter(piece);
+            const angleRad = degToRad(piece.rotation);
+
+            let vertices;
+            if (piece.type === 'square') {
+                vertices = [
+                    { x: piece.x, y: piece.y },
+                    { x: piece.x + PIECE_UNIT_SIZE, y: piece.y },
+                    { x: piece.x + PIECE_UNIT_SIZE, y: piece.y + PIECE_UNIT_SIZE },
+                    { x: piece.x, y: piece.y + PIECE_UNIT_SIZE }
+                ];
+            } else if (piece.type === 'triangle') {
+                vertices = [
+                    { x: piece.x, y: piece.y + PIECE_UNIT_SIZE }, 
+                    { x: piece.x + PIECE_UNIT_SIZE, y: piece.y + PIECE_UNIT_SIZE }, 
+                    { x: piece.x + PIECE_UNIT_SIZE / 2, y: piece.y + PIECE_UNIT_SIZE - TRIANGLE_HEIGHT } 
+                ];
+            }
+
+            const rotatedVertices = vertices.map(v => rotatePoint(v, center, angleRad));
+            const edges = [];
+            for (let i = 0; i < rotatedVertices.length; i++) {
+                const p1 = rotatedVertices[i];
+                const p2 = rotatedVertices[(i + 1) % rotatedVertices.length];
+                let edgeAngleRad = Math.atan2(p2.y - p1.y, p2.x - p1.x);
+                let edgeAngleDeg = normalizeAngle(radToDeg(edgeAngleRad));
+
+                edges.push({ p1: p1, p2: p2, angle: edgeAngleDeg });
+            }
+            return edges;
+        }
+
+        function trySnapToEdges(movingPiece, newX, newY) {
+            let snappedPos = { x: newX, y: newY };
+            let snappedRotation = movingPiece.rotation;
+            const tempMovingPiece = { ...movingPiece, x: newX, y: newY };
+            const movingPieceEdges = getPieceEdgesWithAngles(tempMovingPiece);
+            let bestSnap = null; 
+
+            for (const staticPiece of pieces) {
+                if (staticPiece === movingPiece) continue;
+                const staticPieceEdges = getPieceEdgesWithAngles(staticPiece);
+
+                for (const mEdge of movingPieceEdges) {
+                    for (const sEdge of staticPieceEdges) {
+                        const mMid = { x: (mEdge.p1.x + mEdge.p2.x) / 2, y: (mEdge.p1.y + mEdge.p2.y) / 2 };
+                        const sMid = { x: (sEdge.p1.x + sEdge.p2.x) / 2, y: (sEdge.p1.y + sEdge.p2.y) / 2 };
+                        const dist = getDistance(mMid, sMid);
+
+                        if (dist < EDGE_SNAP_DISTANCE) {
+                            let angleDiff = mEdge.angle - sEdge.angle;
+                            angleDiff = (angleDiff + 180) % 360 - 180; 
+
+                            if (Math.abs(angleDiff) < ROTATION_SNAP_TOLERANCE_DEG || Math.abs(Math.abs(angleDiff) - 180) < ROTATION_SNAP_TOLERANCE_DEG) {
+                                const targetRotation = (Math.abs(angleDiff) < ROTATION_SNAP_TOLERANCE_DEG) ? sEdge.angle : normalizeAngle(sEdge.angle + 180);
+                                const currentRotation = normalizeAngle(movingPiece.rotation);
+                                const rotationDelta = targetRotation - currentRotation;
+
+                                const tempMovingPieceRotated = { ...movingPiece, x: newX, y: newY, rotation: targetRotation };
+                                const tempMovingPieceRotatedEdges = getPieceEdgesWithAngles(tempMovingPieceRotated);
+                                let matchedMEdgeRotated = tempMovingPieceRotatedEdges[movingPieceEdges.indexOf(mEdge)];
+                                
+                                if (!matchedMEdgeRotated) continue;
+
+                                const mMidRotated = { x: (matchedMEdgeRotated.p1.x + matchedMEdgeRotated.p2.x) / 2, y: (matchedMEdgeRotated.p1.y + matchedMEdgeRotated.p2.y) / 2 };
+                                const deltaX = sMid.x - mMidRotated.x;
+                                const deltaY = sMid.y - mMidRotated.y;
+
+                                if (!bestSnap || dist < bestSnap.dist) { 
+                                     bestSnap = {
+                                        deltaX: deltaX,
+                                        deltaY: deltaY,
+                                        rotationDelta: rotationDelta,
+                                        dist: dist
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (bestSnap) {
+                snappedPos.x += bestSnap.deltaX;
+                snappedPos.y += bestSnap.deltaY;
+                snappedRotation = (movingPiece.rotation + bestSnap.rotationDelta);
+                snappedRotation = normalizeAngle(snappedRotation);
+            }
+            return { x: snappedPos.x, y: snappedPos.y, rotation: snappedRotation };
+        }
+
+
+        // --- Interaction Logic ---
+        function getMousePos(e) {
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: e.clientX - rect.left - panOffsetX,
+                y: e.clientY - rect.top - panOffsetY
+            };
+        }
+
+        function getMousePosRaw(e) { 
+            const rect = canvas.getBoundingClientRect();
+            return {
+                x: e.clientX - rect.left,
+                y: e.clientY - rect.top
+            };
+        }
+
+        function onMouseDown(e) {
+            const mousePos = getMousePos(e); 
+            const rawMousePos = getMousePosRaw(e);
+
+            if (e.button === 1) { 
+                isPanning = true;
+                panStartX = e.clientX;
+                panStartY = e.clientY;
+                canvas.style.cursor = 'grab';
+                return;
+            }
+
+            if (selectedPiece && selectedPiece.handlePos) {
+                const handleDist = getDistance(rawMousePos, selectedPiece.handlePos);
+                if (handleDist < ROTATION_HANDLE_RADIUS) {
+                    isRotatingPiece = true;
+                    const centerRaw = {
+                        x: selectedPiece.x + PIECE_UNIT_SIZE / 2 + panOffsetX,
+                        y: selectedPiece.y + PIECE_UNIT_SIZE / 2 + panOffsetY
+                    };
+                    rotationInitialAngle = Math.atan2(rawMousePos.y - centerRaw.y, rawMousePos.x - centerRaw.x);
+                    initialPieceRotation = selectedPiece.rotation;
+                    canvas.style.cursor = 'crosshair';
+                    return; 
+                }
+            }
+
+            for (let i = pieces.length - 1; i >= 0; i--) {
+                const p = pieces[i];
+                const bbox = getRotatedBoundingBox(p);
+                if (
+                    mousePos.x > bbox.x && mousePos.x < bbox.x + bbox.width &&
+                    mousePos.y > bbox.y && mousePos.y < bbox.y + bbox.height
+                ) {
+                    if (selectedPiece !== p) {
+                        deselectPiece();
+                        selectedPiece = p;
+                        pieces.splice(i, 1);
+                        pieces.push(selectedPiece);
+                    }
+                    if (currentTool !== 'placeSquare' && currentTool !== 'placeTriangle') {
+                        isDraggingPiece = true;
+                        dragOffsetX = mousePos.x - p.x;
+                        dragOffsetY = mousePos.y - p.y;
+                        canvas.style.cursor = 'grabbing';
+                    }
+                    draw();
+                    return;
+                }
+            }
+
+            if (currentTool === 'placeSquare' || currentTool === 'placeTriangle') {
+                const newPiece = {
+                    x: mousePos.x - PIECE_UNIT_SIZE / 2,
+                    y: mousePos.y - PIECE_UNIT_SIZE / 2,
+                    rotation: 0,
+                    type: currentTool === 'placeSquare' ? 'square' : 'triangle'
+                };
+
+                if (!isOverlappingExistingPieces(newPiece)) {
+                    pieces.push(newPiece);
+                    selectedPiece = newPiece;
+                    draw();
+                    currentTool = 'select'; 
+                    updateControls();
+                    saveStateToUrl(); // Save immediately on placement
+                }
+            } else {
+                deselectPiece(); 
+            }
+            draw();
+            canvas.style.cursor = 'default';
+        }
+
+        function onMouseMove(e) {
+            const mousePos = getMousePos(e);
+            const rawMousePos = getMousePosRaw(e);
+
+            if (isPanning) {
+                panOffsetX += e.clientX - panStartX;
+                panOffsetY += e.clientY - panStartY;
+                panStartX = e.clientX;
+                panStartY = e.clientY;
+                draw();
+                return;
+            }
+
+            if (isRotatingPiece && selectedPiece) {
+                hasStateChanged = true; // Flag change
+                const centerRaw = {
+                    x: selectedPiece.x + PIECE_UNIT_SIZE / 2 + panOffsetX,
+                    y: selectedPiece.y + PIECE_UNIT_SIZE / 2 + panOffsetY
+                };
+                const currentAngle = Math.atan2(rawMousePos.y - centerRaw.y, rawMousePos.x - centerRaw.x);
+                let angleDiff = radToDeg(currentAngle - rotationInitialAngle);
+
+                selectedPiece.rotation = normalizeAngle(initialPieceRotation + angleDiff);
+                draw();
+                return;
+            }
+
+            if (isDraggingPiece && selectedPiece) {
+                hasStateChanged = true; // Flag change
+                let newX = mousePos.x - dragOffsetX;
+                let newY = mousePos.y - dragOffsetY;
+
+                const snappedResult = trySnapToEdges(selectedPiece, newX, newY);
+                selectedPiece.x = snappedResult.x;
+                selectedPiece.y = snappedResult.y;
+                selectedPiece.rotation = snappedResult.rotation;
+
+                draw();
+                return;
+            }
+
+            let cursor = 'default';
+            if (currentTool === 'placeSquare' || currentTool === 'placeTriangle') {
+                cursor = 'crosshair';
+            } else if (selectedPiece && selectedPiece.handlePos) {
+                 const handleDist = getDistance(rawMousePos, selectedPiece.handlePos);
+                 if (handleDist < ROTATION_HANDLE_RADIUS) {
+                     cursor = 'grab'; 
+                 }
+            }
+            if (cursor === 'default' || cursor === 'grab') { 
+                for (let i = pieces.length - 1; i >= 0; i--) {
+                    const p = pieces[i];
+                    const bbox = getRotatedBoundingBox(p);
+                    if (
+                        mousePos.x > bbox.x && mousePos.x < bbox.x + bbox.width &&
+                        mousePos.y > bbox.y && mousePos.y < bbox.y + bbox.height
+                    ) {
+                        cursor = 'grab'; 
+                        break;
+                    }
+                }
+            }
+            canvas.style.cursor = cursor;
+        }
+
+        function onMouseUp(e) {
+            isDraggingPiece = false;
+            isRotatingPiece = false;
+            isPanning = false;
+            canvas.style.cursor = 'default';
+            
+            // Only save if we actually changed something to avoid spamming history
+            if (hasStateChanged) {
+                saveStateToUrl();
+                hasStateChanged = false;
+            }
+            
+            draw();
+        }
+
+        function onKeyDown(e) {
+            if (e.key === 'Delete' || e.key === 'Backspace') {
+                deleteSelectedPiece();
+                saveStateToUrl();
+                e.preventDefault();
+            }
+
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c') {
+                if (selectedPiece) {
+                    clipboardPiece = { ...selectedPiece };
+                    delete clipboardPiece.handlePos; 
+                }
+            }
+
+            if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') {
+                if (clipboardPiece) {
+                    const offset = 20;
+                    const newPiece = { 
+                        ...clipboardPiece,
+                        x: clipboardPiece.x + offset,
+                        y: clipboardPiece.y + offset
+                    };
+                    clipboardPiece.x += offset;
+                    clipboardPiece.y += offset;
+                    pieces.push(newPiece);
+                    deselectPiece();
+                    selectedPiece = newPiece;
+                    saveStateToUrl(); // Save after paste
+                    draw();
+                }
+            }
+        }
+
+        function deselectPiece() {
+            if (selectedPiece) {
+                selectedPiece.handlePos = null;
+            }
+            selectedPiece = null;
+            draw();
+        }
+
+        function deleteSelectedPiece() {
+            if (selectedPiece) {
+                pieces = pieces.filter(p => p !== selectedPiece);
+                deselectPiece();
+            }
+        }
+
+        function clearCanvas() {
+            pieces = [];
+            selectedPiece = null;
+            clipboardPiece = null; 
+            panOffsetX = 0;
+            panOffsetY = 0;
+            currentTool = 'select';
+            updateControls();
+            draw();
+        }
+
+        function updateControls() {
+            document.getElementById('placeSquareBtn').classList.remove('active');
+            document.getElementById('placeTriangleBtn').classList.remove('active');
+            document.getElementById('currentMode').textContent = 'Select/Drag';
+
+            if (currentTool === 'placeSquare') {
+                document.getElementById('placeSquareBtn').classList.add('active');
+                document.getElementById('currentMode').textContent = 'Place Square';
+            } else if (currentTool === 'placeTriangle') {
+                document.getElementById('placeTriangleBtn').classList.add('active');
+                document.getElementById('currentMode').textContent = 'Place Triangle';
+            }
+        }
+
+        updateControls();
+    </script>
+</body>
+</html>
