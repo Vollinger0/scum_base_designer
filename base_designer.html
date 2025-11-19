@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SCUM Modular Base Designer</title>
+    <!-- Import LZ-String for efficient URL compression -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -155,13 +157,12 @@
         // Handle browser back/forward buttons
         window.addEventListener('popstate', loadStateFromUrl);
 
-        // --- URL Persistence Logic ---
+        // --- URL Persistence Logic (with LZ-String Compression) ---
 
         // Format: Array of [TypeID, x, y, rotation]
         // TypeID: 0 = square, 1 = triangle
         function saveStateToUrl() {
             if (pieces.length === 0) {
-                // Clean URL if empty
                 const url = new URL(window.location);
                 url.searchParams.delete('layout');
                 window.history.replaceState(null, '', url);
@@ -170,19 +171,20 @@
 
             const simplifiedData = pieces.map(p => [
                 p.type === 'square' ? 0 : 1,
-                Math.round(p.x * 100) / 100, // Round to 2 decimals to save space
+                Math.round(p.x * 100) / 100, // Round to 2 decimals
                 Math.round(p.y * 100) / 100,
                 Math.round(p.rotation * 100) / 100
             ]);
 
             const jsonString = JSON.stringify(simplifiedData);
-            // Base64 encode the string
-            const encoded = btoa(jsonString);
+            
+            // COMPRESSION HERE
+            // compressToEncodedURIComponent produces URL-safe string
+            const compressed = LZString.compressToEncodedURIComponent(jsonString);
 
             const url = new URL(window.location);
-            url.searchParams.set('layout', encoded);
+            url.searchParams.set('layout', compressed);
             
-            // replaceState updates URL without reloading page
             window.history.replaceState(null, '', url);
 
             // Visual feedback
@@ -197,7 +199,23 @@
             if (!encoded) return;
 
             try {
-                const jsonString = atob(encoded);
+                // DECOMPRESSION HERE
+                let jsonString = LZString.decompressFromEncodedURIComponent(encoded);
+
+                // Fallback: If decompression returns null (maybe it was an old non-compressed link),
+                // try the old Base64 method just in case, or just fail gracefully.
+                if (!jsonString) {
+                    try {
+                         // Attempt legacy decoding if you had old links floating around
+                         jsonString = atob(encoded); 
+                    } catch(err) {
+                        console.log("Could not decompress layout.");
+                        return;
+                    }
+                }
+                
+                if (!jsonString) return;
+
                 const simplifiedData = JSON.parse(jsonString);
 
                 pieces = simplifiedData.map(item => ({
